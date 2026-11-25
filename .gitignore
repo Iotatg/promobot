@@ -174,3 +174,12 @@
 *.lz
 *.lzma
 *.iso
+
+# Promobot
+.env
+.tdlib/
+*.tdlib
+promobot_data.json
+
+# TDLib native library
+libtdjson.so*
