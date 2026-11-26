@@ -80,9 +80,10 @@ type MediaInput struct {
 
 // blindReply matches AI replies that pretend the media was not received or not
 // understood (mirrors media_analyzer.py's _BLIND_RE, extended to catch audio
-// evasions like "samajh nahi aaya / unclear / sunai nahi"). It is only applied
-// to media answers, so a bare "samajh nahi" always means the analysis failed.
-var blindReply = regexp.MustCompile(`(?i)(attach nahi|nahi hui|nahi hua|nahi hai yahan|nahi mili|nahi mila|nahi aayi|nahi aaya|blank dikh|kuch nahi dikh|kuch attach nahi|kuch nahi aaya|pdf khul nahi|khul nahi raha|khul hi nahi|koi (video|file|audio|image|photo|attachment) nahi|file attach nahi|video nahi|audio nahi|voice nahi|samajh nahi|sunai nahi|sun nahi|awaaz nahi|awaz nahi|unclear|not clear|clear nahi|don't see|do not see|nothing attached|no (video|file|audio|image|attachment)|can't (see|open|play|read|hear|understand)|cannot (see|open|play|read|hear|understand)|not attached|didn't (get|receive|see|hear)|did not (get|receive|see|hear)|unable to (see|open|play|read|hear|understand)|couldn't (see|open|play|read|hear|understand))`)
+// evasions like "samajh nahi aaya / unclear / sunai nahi / phir se bol"). It is
+// only applied to media answers, so a bare "samajh nahi" always means the
+// analysis failed.
+var blindReply = regexp.MustCompile(`(?i)(attach nahi|nahi hui|nahi hua|nahi hai yahan|nahi mili|nahi mila|nahi aayi|nahi aaya|blank dikh|kuch nahi dikh|kuch attach nahi|kuch nahi aaya|pdf khul nahi|khul nahi raha|khul hi nahi|koi (video|file|audio|image|photo|attachment) nahi|file attach nahi|video nahi|audio nahi|voice nahi|samajh nahi|samjha nahi|samajh na|sunai nahi|sunai na|suna nahi|suni nahi|sun nahi|nahi sunai|nahi suna|theek se suna|sahi se suna|theek se sunai|awaaz nahi|awaz nahi|awaaz clear nahi|awaz clear nahi|audio clear nahi|voice clear nahi|kya bola|kya kaha|phir se bol|phir se bolo|phir bolo|phir bol|dobara bol|dobara bolo|ek baar phir|wapas bol|audio (unclear|garbled|broken|not clear|distorted)|voice (unclear|garbled|broken|not clear|distorted)|unclear|not clear|clear nahi|don't see|do not see|nothing attached|no (video|file|audio|image|attachment)|can't (see|open|play|read|hear|understand)|cannot (see|open|play|read|hear|understand)|not attached|didn't (get|receive|see|hear|catch)|did not (get|receive|see|hear|catch)|unable to (see|open|play|read|hear|understand)|couldn't (see|open|play|read|hear|understand|catch|make out)|cannot make out|not audible|inaudible|didn't get the audio|no audio|say (that |it )?again|send (it )?again|come again|\brepeat\b)`)
 
 // thinkRe strips <think>...</think> reasoning blocks some models emit.
 var thinkRe = regexp.MustCompile(`(?is)<think>.*?</think>`)
@@ -136,7 +137,7 @@ func (c *Client) AnalyzeMedia(ctx context.Context, caption string, in MediaInput
 		text += "\n\nRecent chat context (for continuity):\n" + ctxText
 	}
 	if cap := strings.TrimSpace(caption); cap != "" {
-		text += "\n\n" + cap
+		text += "\n\n" + sanitizeArtifacts(cap)
 	} else {
 		text += "\n\n" + EmptyCaption
 	}
@@ -149,7 +150,7 @@ func (c *Client) AnalyzeMedia(ctx context.Context, caption string, in MediaInput
 				lastErr = err
 				continue
 			}
-			reply = stripThinking(reply)
+			reply = sanitizeArtifacts(stripThinking(reply))
 			if reply == "" || blindReply.MatchString(reply) {
 				lastErr = fmt.Errorf("empty or blind reply")
 				continue

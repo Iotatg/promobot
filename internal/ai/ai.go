@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +16,110 @@ import (
 
 // defaultMaxTurns is how many recent messages are kept per session.
 const defaultMaxTurns = 24
+
+// artifactTagRe matches stray control/parameter tags such as "</rfl:parameter>"
+// that occasionally leak into the prompt or the model reply.
+var artifactTagRe = regexp.MustCompile(`</?[A-Za-z][A-Za-z0-9_.-]*:[A-Za-z][A-Za-z0-9_.-]*(\s[^<>]*)?/?>`)
+
+// multiSpaceRe collapses runs of spaces/tabs left behind after inline removal.
+var multiSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
+
+// sanitizeArtifacts removes stray namespace-style tags from text. Lines that
+// consist only of such tags are dropped entirely; inline tags are stripped.
+func sanitizeArtifacts(s string) string {
+	if s == "" || !artifactTagRe.MatchString(s) {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	out := make([]string, 0, len(lines))
+	for _, ln := range lines {
+		if strings.TrimSpace(ln) == "" || !artifactTagRe.MatchString(ln) {
+			out = append(out, ln)
+			continue
+		}
+		cleaned := multiSpaceRe.ReplaceAllString(artifactTagRe.ReplaceAllString(ln, ""), " ")
+		if strings.TrimSpace(cleaned) == "" {
+			continue
+		}
+		out = append(out, cleaned)
+	}
+	return strings.TrimSpace(strings.Join(out, "\n"))
+}
+
+// robotPhraseRe matches the canned "assistant/bot" filler the persona must
+// never use. The model keeps emitting these despite the prompt, so they are
+// stripped deterministically from every reply.
+var robotPhraseRe = regexp.MustCompile(`(?i)(?:bol\s+kaam\s+ka\s+scene(?:\s+kya\s+hai)?|kaam\s+ka\s+scene(?:\s+kya\s+hai)?|kya\s+scene\s+hai|scene\s+kya\s+hai|kya\s+kaam\s+hai|kaam\s+kya\s+hai|bata\s+na\s+kya\s+chahiye|bata\s+na\s+kya\s+kaam(?:\s+hai)?|ye\s+kya\s+majak\s+hai)`)
+
+var (
+	robotCommaRe = regexp.MustCompile(`\s*,\s*(?:,\s*)+`)
+	robotSpaceRe = regexp.MustCompile(`[ \t]{2,}`)
+	robotPunctRe = regexp.MustCompile(`\s+([,.!?])`)
+)
+
+// deRobotize strips the robotic filler phrases and tics the persona forbids,
+// then tidies the leftover punctuation so the text still reads naturally.
+func deRobotize(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return s
+	}
+	s = robotPhraseRe.ReplaceAllString(s, "")
+	s = capWord(s, "tu bata", 1)
+	s = capWord(s, "hehe", 1)
+	s = capEmoji(s, "😏", 1)
+	s = robotCommaRe.ReplaceAllString(s, ", ")
+	s = robotPunctRe.ReplaceAllString(s, "$1")
+	s = robotSpaceRe.ReplaceAllString(s, " ")
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, " ,")
+	if s == "" {
+		return "hmm"
+	}
+	return s
+}
+
+// capWord keeps at most n case-insensitive occurrences of word, dropping the
+// rest. Word boundaries keep it from cutting inside other words.
+func capWord(s, word string, n int) string {
+	re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(word))
+	idx := re.FindAllStringIndex(s, -1)
+	if len(idx) <= n {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	kept := 0
+	for _, loc := range idx {
+		if kept < n {
+			kept++
+			continue
+		}
+		b.WriteString(s[last:loc[0]])
+		last = loc[1]
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// capEmoji keeps at most n occurrences of an emoji, dropping the rest.
+func capEmoji(s, emoji string, n int) string {
+	if strings.Count(s, emoji) <= n {
+		return s
+	}
+	var b strings.Builder
+	kept := 0
+	for _, r := range s {
+		if string(r) == emoji {
+			if kept < n {
+				kept++
+				b.WriteRune(r)
+			}
+			continue
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
 
 // Client is a minimal OpenAI-compatible chat completions client.
 type Client struct {
@@ -50,6 +155,9 @@ type Memory interface {
 	LoadMemory(ctx context.Context, key string, max int) ([]Turn, error)
 	SaveMemory(ctx context.Context, key string, turns []Turn) error
 	ClearMemory(ctx context.Context, key string) error
+	// ClearMemoryByPrefix deletes every stored conversation whose key starts
+	// with prefix+"|", returning how many were removed.
+	ClearMemoryByPrefix(ctx context.Context, prefix string) (int64, error)
 }
 
 // New creates an AI client. url is the full chat completions endpoint. system
@@ -181,7 +289,7 @@ func (c *Client) RecentContext(ctx context.Context, key string, n int) string {
 
 	var b strings.Builder
 	for _, t := range hist {
-		content := strings.TrimSpace(t.Content)
+		content := sanitizeArtifacts(strings.TrimSpace(t.Content))
 		if content == "" {
 			continue
 		}
@@ -244,12 +352,23 @@ func (c *Client) ask(ctx context.Context, model, key, prompt string) (string, er
 	if strings.TrimSpace(model) == "" {
 		model = c.model
 	}
+	prompt = sanitizeArtifacts(prompt)
 
-	reqBody := chatRequest{
+	reply, err := c.rawChat(ctx, chatRequest{
 		Model:       model,
 		Messages:    c.buildMessages(ctx, key, prompt),
 		Temperature: 0.7,
+	})
+	if err != nil {
+		return "", err
 	}
+	reply = deRobotize(sanitizeArtifacts(reply))
+	c.remember(ctx, key, prompt, reply)
+	return reply, nil
+}
+
+// rawChat marshals and sends a chat request, returning the first choice content.
+func (c *Client) rawChat(ctx context.Context, reqBody chatRequest) (string, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
@@ -282,9 +401,63 @@ func (c *Client) ask(ctx context.Context, model, key, prompt string) (string, er
 	if len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("llm returned no choices")
 	}
-	reply := strings.TrimSpace(parsed.Choices[0].Message.Content)
-	c.remember(ctx, key, prompt, reply)
-	return reply, nil
+	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+}
+
+// DecideMood asks the model to classify the mood of a chat message into a single
+// category (happy, love, funny, angry, sad, shock, hype, cool, sleepy, like or
+// none). It is stateless (no persona, no memory) and best-effort; callers map
+// the mood to an emoji pool and fall back to the offline engine on error.
+func (c *Client) DecideMood(ctx context.Context, text string) (string, error) {
+	if c.url == "" {
+		return "", fmt.Errorf("chat url is not configured")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "none", nil
+	}
+	sys := "You classify the mood of a chat message into EXACTLY ONE category from this list: " +
+		"happy, love, funny, angry, sad, shock, hype, cool, sleepy, like, none. " +
+		"Reply with only that single word, nothing else."
+	reply, err := c.rawChat(ctx, chatRequest{
+		Model: c.model,
+		Messages: []Turn{
+			{Role: "system", Content: sys},
+			{Role: "user", Content: clipRunes(text, 300)},
+		},
+		Temperature: 0.2,
+	})
+	if err != nil {
+		return "", err
+	}
+	return normalizeMood(reply), nil
+}
+
+// normalizeMood extracts the first recognized mood word from reply, defaulting
+// to "none".
+func normalizeMood(reply string) string {
+	low := strings.ToLower(reply)
+	for _, m := range []string{"happy", "love", "funny", "angry", "sad", "shock", "hype", "cool", "sleepy", "like", "none"} {
+		if strings.Contains(low, m) {
+			return m
+		}
+	}
+	return "none"
+}
+
+// ClearAllMemory clears the in-memory cache and every persisted conversation for
+// this client's namespace, returning how many stored docs were removed.
+func (c *Client) ClearAllMemory(ctx context.Context) (int64, error) {
+	c.mu.Lock()
+	c.sessions = make(map[string][]Turn)
+	c.loaded = make(map[string]bool)
+	mem := c.mem
+	ns := c.ns
+	c.mu.Unlock()
+	if mem == nil || ns == "" {
+		return 0, nil
+	}
+	return mem.ClearMemoryByPrefix(ctx, ns)
 }
 
 // buildMessages prepends the system prompt (with the current IST time) and any

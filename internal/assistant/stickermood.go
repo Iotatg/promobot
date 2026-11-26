@@ -131,13 +131,14 @@ func autoMoodFromSet(set *tg.MessagesStickerSet) string {
 	return mood.Sanitize(set.Set.Title)
 }
 
-// sendStickerRef sends a stored assistant reference to a chat.
-func (c *Client) sendStickerRef(ctx context.Context, chatID int64, ref string) bool {
+// sendStickerRef sends a stored assistant reference to a chat, optionally
+// quoting the message identified by replyTo.
+func (c *Client) sendStickerRef(ctx context.Context, chatID int64, ref string, replyTo int) bool {
 	doc, ok := decDocRef(ref)
 	if !ok {
 		return false
 	}
-	if err := c.SendSticker(chatID, doc); err != nil {
+	if err := c.sendSticker(chatID, doc, replyTo); err != nil {
 		slog.Warn("assistant sticker ref send failed", "err", err)
 		return false
 	}
@@ -147,7 +148,7 @@ func (c *Client) sendStickerRef(ctx context.Context, chatID int64, ref string) b
 // replyStickerForMood sends a sticker from the first non-empty mood pack among
 // the candidate moods (exact mood, then related), mirroring
 // _reply_sticker_for_mood.
-func (c *Client) replyStickerForMood(ctx context.Context, chatID int64, wantMood string, incomingID int64) bool {
+func (c *Client) replyStickerForMood(ctx context.Context, chatID int64, wantMood string, incomingID int64, replyTo int) bool {
 	for _, cand := range mood.Candidates(wantMood) {
 		refs, err := c.st.GetStickersForMood(ctx, cand)
 		if err != nil {
@@ -157,14 +158,14 @@ func (c *Client) replyStickerForMood(ctx context.Context, chatID int64, wantMood
 		if len(refs) == 0 {
 			continue
 		}
-		return c.sendStickerRef(ctx, chatID, pickOther(refs, incomingID))
+		return c.sendStickerRef(ctx, chatID, pickOther(refs, incomingID), replyTo)
 	}
 	return false
 }
 
 // replyAnySticker sends a sticker from any mood pack, mirroring
 // _reply_any_sticker.
-func (c *Client) replyAnySticker(ctx context.Context, chatID int64, incomingID int64) bool {
+func (c *Client) replyAnySticker(ctx context.Context, chatID int64, incomingID int64, replyTo int) bool {
 	packs, err := c.st.ListStickerPacks(ctx)
 	if err != nil {
 		return false
@@ -180,13 +181,13 @@ func (c *Client) replyAnySticker(ctx context.Context, chatID int64, incomingID i
 	if len(all) == 0 {
 		return false
 	}
-	return c.sendStickerRef(ctx, chatID, pickOther(all, incomingID))
+	return c.sendStickerRef(ctx, chatID, pickOther(all, incomingID), replyTo)
 }
 
 // autoReplyFromPack mirrors IotaXMedia's _auto_reply_from_pack: it learns the
 // whole pack the received sticker belongs to (into a mood pack), then replies
 // with a different sticker from that same pack.
-func (c *Client) autoReplyFromPack(ctx context.Context, chatID int64, doc *tg.Document) bool {
+func (c *Client) autoReplyFromPack(ctx context.Context, chatID int64, doc *tg.Document, replyTo int) bool {
 	set, key, ok := docSetInput(doc)
 	if !ok {
 		return false
@@ -195,7 +196,7 @@ func (c *Client) autoReplyFromPack(ctx context.Context, chatID int64, doc *tg.Do
 	if cached := c.cachedPackMood(key); cached != "" {
 		if refs, err := c.st.GetStickersForMood(ctx, cached); err == nil {
 			if ar := assistantRefs(refs); len(ar) > 0 {
-				if c.sendStickerRef(ctx, chatID, pickOther(ar, doc.ID)) {
+				if c.sendStickerRef(ctx, chatID, pickOther(ar, doc.ID), replyTo) {
 					return true
 				}
 			}
@@ -230,7 +231,7 @@ func (c *Client) autoReplyFromPack(ctx context.Context, chatID int64, doc *tg.Do
 		}
 		return false
 	}
-	return c.sendStickerRef(ctx, chatID, pickOther(refs, doc.ID))
+	return c.sendStickerRef(ctx, chatID, pickOther(refs, doc.ID), replyTo)
 }
 
 func (c *Client) cachedPackMood(key string) string {

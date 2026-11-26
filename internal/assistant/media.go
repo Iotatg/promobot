@@ -89,23 +89,24 @@ func (c *Client) replyMoodSticker(ctx context.Context, m *tg.Message) {
 	}
 	chatID := chatIDFromPeer(m.PeerID)
 	wantMood := mood.FromEmoji(emojiFromDoc(doc))
+	replyTo := m.ID
 	slog.Info("replyMoodSticker", "mood", wantMood, "hasStore", c.st != nil, "hasProvider", c.moodSticker != nil)
 
 	if c.st != nil {
-		if c.replyStickerForMood(ctx, chatID, wantMood, doc.ID) {
+		if c.replyStickerForMood(ctx, chatID, wantMood, doc.ID, replyTo) {
 			return
 		}
-		if c.autoReplyFromPack(ctx, chatID, doc) {
+		if c.autoReplyFromPack(ctx, chatID, doc, replyTo) {
 			return
 		}
-		if c.replyAnySticker(ctx, chatID, doc.ID) {
+		if c.replyAnySticker(ctx, chatID, doc.ID, replyTo) {
 			return
 		}
 	}
 
 	if c.moodSticker != nil {
 		if path, ok := c.moodSticker(chatID, wantMood); ok && path != "" {
-			if err := c.SendMedia(chatID, store.Media{Kind: media.KindSticker, Source: path}); err != nil {
+			if err := c.sendMedia(chatID, store.Media{Kind: media.KindSticker, Source: path}, replyTo); err != nil {
 				slog.Warn("mood sticker send failed", "mood", wantMood, "err", err)
 			} else {
 				slog.Info("mood sticker sent", "mood", wantMood)
@@ -116,7 +117,7 @@ func (c *Client) replyMoodSticker(ctx context.Context, m *tg.Message) {
 	}
 
 	if sd, err := c.RandomSticker(ctx, StickerStatic); err == nil && sd != nil {
-		if err := c.SendSticker(chatID, sd); err != nil {
+		if err := c.sendSticker(chatID, sd, replyTo); err != nil {
 			slog.Warn("fallback sticker send failed", "err", err)
 		} else {
 			slog.Info("fallback sticker sent")

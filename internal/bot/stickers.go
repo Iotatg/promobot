@@ -54,9 +54,6 @@ func (b *Bot) cmdAddSticker(c *gotdbot.Client, msg *gotdbot.Message) error {
 
 // cmdStickerPacks lists all mood packs and the assistant's auto-save packs.
 func (b *Bot) cmdStickerPacks(c *gotdbot.Client, msg *gotdbot.Message) error {
-	if !b.isOwner(msg) {
-		return nil
-	}
 	packs, err := b.store.ListStickerPacks(context.Background())
 	if err != nil {
 		_, rerr := msg.ReplyText(c, "Failed to load packs: "+err.Error(), nil)
@@ -106,9 +103,6 @@ func (b *Bot) cmdClearStickers(c *gotdbot.Client, msg *gotdbot.Message) error {
 
 // cmdSticker sends a random sticker from a mood pack.
 func (b *Bot) cmdSticker(c *gotdbot.Client, msg *gotdbot.Message) error {
-	if !b.isOwner(msg) {
-		return nil
-	}
 	pack := mood.Sanitize(strings.TrimSpace(msg.Args()))
 	if strings.TrimSpace(msg.Args()) == "" {
 		_, err := msg.ReplyText(c, "Usage: /sticker <mood>", nil)
@@ -195,9 +189,6 @@ func (b *Bot) cmdAddPack(c *gotdbot.Client, msg *gotdbot.Message) error {
 // cmdPreviewSticker sends one sticker from a mood pack, mirroring IotaXMedia's
 // /preview-sticker.
 func (b *Bot) cmdPreviewSticker(c *gotdbot.Client, msg *gotdbot.Message) error {
-	if !b.isOwner(msg) {
-		return nil
-	}
 	pack := mood.Sanitize(strings.TrimSpace(msg.Args()))
 	if strings.TrimSpace(msg.Args()) == "" {
 		_, err := msg.ReplyText(c, "Usage: /previewsticker <mood>", nil)

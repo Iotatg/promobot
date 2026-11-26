@@ -54,6 +54,8 @@ type Manager struct {
 	// personaName is the effective trigger/identity name, overridable at runtime
 	// via /persona so new accounts pick it up too.
 	personaName string
+	// reactMode is the reaction decision mode applied to new accounts.
+	reactMode string
 }
 
 // NewManager constructs a Manager.
@@ -64,6 +66,7 @@ func NewManager(cfg *config.Config, st store.Store, aiClient *ai.Client) *Manage
 		baseAI:      aiClient,
 		accounts:    make(map[string]*account),
 		personaName: cfg.PersonaName,
+		reactMode:   ReactModeBoth,
 	}
 	if st != nil {
 		m.mem = st
@@ -97,6 +100,7 @@ func (m *Manager) AddSession(ctx context.Context, session string) (string, int64
 	m.mu.RLock()
 	mood := m.mood
 	personaName := m.personaName
+	reactMode := m.reactMode
 	m.mu.RUnlock()
 
 	aic := m.baseAI.Clone()
@@ -105,6 +109,7 @@ func (m *Manager) AddSession(ctx context.Context, session string) (string, int64
 		return "", 0, err
 	}
 	client.SetPersona(personaName)
+	client.SetReactMode(reactMode)
 	client.SetStore(m.st)
 	if mood != nil {
 		client.SetMoodStickerProvider(mood)
@@ -177,6 +182,56 @@ func (m *Manager) SetPersonaName(name string) {
 		a.client.SetPersona(name)
 	}
 	m.mu.Unlock()
+}
+
+// SetReactMode changes the reaction decision mode (offline, ai or both) on the
+// manager and every connected account, so new accounts inherit it too.
+func (m *Manager) SetReactMode(mode string) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	switch mode {
+	case ReactModeOffline, ReactModeAI, ReactModeBoth:
+	default:
+		return
+	}
+	m.mu.Lock()
+	m.reactMode = mode
+	for _, a := range m.accounts {
+		a.client.SetReactMode(mode)
+	}
+	m.mu.Unlock()
+}
+
+// ReactMode returns the current reaction decision mode.
+func (m *Manager) ReactMode() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.reactMode == "" {
+		return ReactModeBoth
+	}
+	return m.reactMode
+}
+
+// ClearAllMemory clears every user's stored conversation for all connected
+// assistant accounts, returning the number of memory documents removed.
+func (m *Manager) ClearAllMemory(ctx context.Context) (int64, error) {
+	m.mu.RLock()
+	clients := make([]*ai.Client, 0, len(m.accounts))
+	for _, a := range m.accounts {
+		if a.aic != nil {
+			clients = append(clients, a.aic)
+		}
+	}
+	m.mu.RUnlock()
+
+	var total int64
+	for _, aic := range clients {
+		n, err := aic.ClearAllMemory(ctx)
+		if err != nil {
+			return total, err
+		}
+		total += n
+	}
+	return total, nil
 }
 
 // LeaveChat makes the primary assistant leave a single named chat.
@@ -321,6 +376,16 @@ func (m *Manager) IsAdmin(chatID int64) (bool, error) {
 		return false, ErrNotConnected
 	}
 	return c.IsAdmin(chatID)
+}
+
+// CanPost reports whether the primary assistant can post in the chat (admin or,
+// for groups, an unrestricted member).
+func (m *Manager) CanPost(chatID int64) (bool, error) {
+	c := m.current()
+	if c == nil {
+		return false, ErrNotConnected
+	}
+	return c.CanPost(chatID)
 }
 
 // SendText sends a text message as the assistant.

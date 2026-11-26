@@ -12,13 +12,6 @@ import (
 
 // cmdAsk answers a one-off prompt with the configured LLM.
 func (b *Bot) cmdAsk(c *gotdbot.Client, msg *gotdbot.Message) error {
-	allowed := b.isOwner(msg)
-	if !allowed {
-		allowed, _ = b.store.IsChatbotEnabled(context.Background(), msg.ChatId)
-	}
-	if !allowed {
-		return nil
-	}
 	prompt := strings.TrimSpace(msg.Args())
 	if prompt == "" && msg.ReplyToMessageID() != 0 {
 		if replied, err := b.c.GetMessage(msg.ChatId, msg.ReplyToMessageID()); err == nil {

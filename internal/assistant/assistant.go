@@ -54,6 +54,10 @@ type Client struct {
 	mu        sync.Mutex
 	lastReply map[int64]time.Time
 
+	reactMu   sync.Mutex
+	lastReact map[int64]time.Time
+	reactMode string
+
 	packsMu   sync.Mutex
 	autoPacks map[string]*PackInfo
 	// autoSavedPacks caches the derived mood for a learned sticker set key,
@@ -114,6 +118,7 @@ func FromPyrogramSession(appID int, appHash, sessionString string, aiClient *ai.
 	}
 
 	c := &Client{done: make(chan struct{}), ai: aiClient, lastReply: make(map[int64]time.Time),
+		lastReact: make(map[int64]time.Time), reactMode: ReactModeBoth,
 		mediaSlots: make(chan struct{}, maxInFlight), albumSeen: make(map[string]time.Time)}
 	raw := telegram.NewClient(appID, appHash, telegram.Options{
 		SessionStorage: mem,
@@ -229,6 +234,64 @@ func (c *Client) IsAdmin(chatID int64) (bool, error) {
 	return false, nil
 }
 
+// CanPost reports whether the assistant can post in the given chat. Admins can
+// always post; a plain member may post in supergroups and basic groups when
+// sending is not restricted. Broadcast channels still require admin rights.
+func (c *Client) CanPost(chatID int64) (bool, error) {
+	ctx := context.Background()
+	switch {
+	case chatID <= -channelPrefix:
+		ch, err := c.pm.ResolveChannelID(ctx, rawChannelID(chatID))
+		if err != nil {
+			return false, err
+		}
+		raw := ch.Raw()
+		ip, ok := ch.InputPeer().(*tg.InputPeerChannel)
+		if !ok {
+			return false, fmt.Errorf("unexpected peer type")
+		}
+		res, err := c.api.ChannelsGetParticipant(ctx, &tg.ChannelsGetParticipantRequest{
+			Channel:     &tg.InputChannel{ChannelID: ip.ChannelID, AccessHash: ip.AccessHash},
+			Participant: &tg.InputPeerSelf{},
+		})
+		if err != nil {
+			return false, err
+		}
+		switch res.Participant.(type) {
+		case *tg.ChannelParticipantCreator, *tg.ChannelParticipantAdmin:
+			return true, nil
+		case *tg.ChannelParticipant, *tg.ChannelParticipantSelf:
+			// A regular member (ChannelParticipantSelf is returned when the
+			// participant is the requesting account itself).
+			if !raw.Megagroup {
+				return false, fmt.Errorf("assistant is only a member; admin is required for broadcast channels")
+			}
+			if raw.DefaultBannedRights.SendMessages {
+				return false, fmt.Errorf("members cannot send messages in this supergroup")
+			}
+			return true, nil
+		case *tg.ChannelParticipantBanned:
+			return false, fmt.Errorf("assistant is restricted in this chat")
+		}
+		return false, fmt.Errorf("assistant is not a member of this chat")
+	case chatID < 0:
+		chat, err := c.pm.ResolveChatID(ctx, -chatID)
+		if err != nil {
+			return false, err
+		}
+		raw := chat.Raw()
+		if raw.Left {
+			return false, fmt.Errorf("assistant has left this group")
+		}
+		if raw.DefaultBannedRights.SendMessages {
+			return false, fmt.Errorf("members cannot send messages in this group")
+		}
+		return true, nil
+	default:
+		return false, fmt.Errorf("not a group or channel")
+	}
+}
+
 // LeaveChat makes the assistant leave a single channel/supergroup it is a
 // member of. Callers must scope this to one explicitly named, owner-approved
 // chat; it is never used for bulk leaving.
@@ -261,6 +324,12 @@ func (c *Client) SendText(chatID int64, text string) error {
 
 // SendMedia uploads and sends a media attachment as the assistant.
 func (c *Client) SendMedia(chatID int64, m store.Media) error {
+	return c.sendMedia(chatID, m, 0)
+}
+
+// sendMedia uploads and sends a media attachment, optionally quoting the
+// message identified by replyTo (0 means no reply).
+func (c *Client) sendMedia(chatID int64, m store.Media, replyTo int) error {
 	if m.IsRemote {
 		return fmt.Errorf("assistant cannot send remote media file ids")
 	}
@@ -269,12 +338,17 @@ func (c *Client) SendMedia(chatID int64, m store.Media) error {
 		return err
 	}
 	ctx := context.Background()
+	s := message.NewSender(c.api).To(peer)
+	b := &s.Builder
+	if replyTo > 0 {
+		b = b.Reply(replyTo)
+	}
 	if m.Kind == media.KindSticker {
 		c.chooseSticker(ctx, peer)
-		_, err := message.NewSender(c.api).To(peer).Upload(message.FromPath(m.Source)).Sticker(ctx)
+		_, err := b.Upload(message.FromPath(m.Source)).Sticker(ctx)
 		return err
 	}
-	up := message.NewSender(c.api).To(peer).Upload(message.FromPath(m.Source))
+	up := b.Upload(message.FromPath(m.Source))
 	caption := styling.Plain(m.Caption)
 	switch m.Kind {
 	case media.KindPhoto:
@@ -377,9 +451,21 @@ func (c *Client) handleUpdate(ctx context.Context, u tg.UpdatesClass) error {
 	if m == nil || c.pm == nil || c.api == nil {
 		return nil
 	}
+	c.applyEntities(ctx, u)
 	slog.Debug("assistant update", "peer", peerKind(m.PeerID), "media", mediaKindName(m), "out", m.Out)
 	go c.processMessage(context.Background(), m)
 	return nil
+}
+
+// applyEntities caches the users/chats carried by an update so the peers manager
+// can resolve senders (needed to mention users in group replies).
+func (c *Client) applyEntities(ctx context.Context, u tg.UpdatesClass) {
+	switch u := u.(type) {
+	case *tg.Updates:
+		_ = c.pm.Apply(ctx, u.Users, u.Chats)
+	case *tg.UpdatesCombined:
+		_ = c.pm.Apply(ctx, u.Users, u.Chats)
+	}
 }
 
 func peerKind(p tg.PeerClass) string {
@@ -447,6 +533,10 @@ func (c *Client) processMessage(ctx context.Context, m *tg.Message) {
 		}
 	}
 
+	// Drop a contextual emoji reaction on incoming messages (IotaXMedia parity),
+	// independent of whether the assistant also replies.
+	c.maybeReact(ctx, m)
+
 	isDM := false
 	if _, ok := m.PeerID.(*tg.PeerUser); ok {
 		isDM = true
@@ -457,12 +547,15 @@ func (c *Client) processMessage(ctx context.Context, m *tg.Message) {
 		triggered = c.mentionsOrReplies(ctx, m, m.Message)
 	}
 	if !triggered {
+		slog.Debug("assistant message ignored (group, not addressed)",
+			"chat", chatIDFromPeer(m.PeerID), "sender", senderForLog(m),
+			"sticker", isSticker(m), "reply", m.ReplyTo != nil, "text", truncate(m.Message))
 		return
 	}
 	if c.fromBot(ctx, m) {
 		return
 	}
-	slog.Info("assistant handling message", "dm", isDM, "chat", chatIDFromPeer(m.PeerID), "media", mediaKindName(m), "text", truncate(m.Message))
+	slog.Info("assistant handling message", "dm", isDM, "chat", chatIDFromPeer(m.PeerID), "sender", senderForLog(m), "media", mediaKindName(m), "text", truncate(m.Message))
 
 	if isSticker(m) {
 		if !c.allow(m) {
@@ -492,7 +585,9 @@ func (c *Client) processMessage(ctx context.Context, m *tg.Message) {
 	if !isDM {
 		text = c.stripTrigger(text)
 		if text == "" {
-			return
+			// The assistant was addressed by name only (e.g. "Radhika"): greet
+			// instead of staying silent.
+			text = "hi"
 		}
 	}
 	if answer, handled := c.tryReplyToMedia(ctx, m, text); handled {
@@ -555,12 +650,8 @@ func (c *Client) SetPersona(name string) {
 // mentionsOrReplies reports whether a group message addresses the assistant by
 // reply, @username, persona name, or a mention-name entity.
 func (c *Client) mentionsOrReplies(ctx context.Context, m *tg.Message, text string) bool {
-	if rh, ok := m.ReplyTo.(*tg.MessageReplyHeader); ok {
-		if fwd, ok := rh.GetReplyFrom(); ok {
-			if u, ok := fwd.FromID.(*tg.PeerUser); ok && c.selfID != 0 && u.UserID == c.selfID {
-				return true
-			}
-		}
+	if c.repliesToSelf(ctx, m) {
+		return true
 	}
 	lower := strings.ToLower(text)
 	if c.selfUsername != "" && strings.Contains(lower, "@"+c.selfUsername) {
@@ -572,6 +663,44 @@ func (c *Client) mentionsOrReplies(ctx context.Context, m *tg.Message, text stri
 		}
 	}
 	if c.personaRe != nil && c.personaRe.MatchString(text) {
+		return true
+	}
+	return false
+}
+
+// repliesToSelf reports whether m is a reply to a message sent by this
+// account. Telegram only populates the reply header's ReplyFrom for some
+// cases (cross-chat/story replies), so when it is absent we fall back to
+// fetching the replied-to message and checking its sender.
+func (c *Client) repliesToSelf(ctx context.Context, m *tg.Message) bool {
+	rh, ok := m.ReplyTo.(*tg.MessageReplyHeader)
+	if !ok {
+		return false
+	}
+	if fwd, ok := rh.GetReplyFrom(); ok {
+		if u, ok := fwd.FromID.(*tg.PeerUser); ok && c.selfID != 0 && u.UserID == c.selfID {
+			return true
+		}
+	}
+	if c.selfID == 0 {
+		return false
+	}
+	id, ok := rh.GetReplyToMsgID()
+	if !ok || id == 0 {
+		return false
+	}
+	peer := m.PeerID
+	if p, ok := rh.GetReplyToPeerID(); ok && p != nil {
+		peer = p
+	}
+	replied, err := c.fetchMessage(ctx, peer, id)
+	if err != nil || replied == nil {
+		return false
+	}
+	if replied.Out {
+		return true
+	}
+	if u, ok := replied.FromID.(*tg.PeerUser); ok && u.UserID == c.selfID {
 		return true
 	}
 	return false
@@ -618,6 +747,17 @@ func (c *Client) senderID(m *tg.Message) (int64, bool) {
 	return 0, false
 }
 
+// senderForLog returns the sender user id for logging, or 0 when unknown.
+func senderForLog(m *tg.Message) int64 {
+	if u, ok := m.FromID.(*tg.PeerUser); ok {
+		return u.UserID
+	}
+	if pu, ok := m.PeerID.(*tg.PeerUser); ok {
+		return pu.UserID
+	}
+	return 0
+}
+
 func (c *Client) isBot(ctx context.Context, userID int64) bool {
 	u, err := c.pm.ResolveUserID(ctx, userID)
 	if err != nil {
@@ -643,14 +783,20 @@ func truncate(s string) string {
 	return s
 }
 
-// sendToChat replies to the chat a message came from (DM or group).
+// sendToChat replies to the chat a message came from (DM or group), quoting the
+// triggering message.
 func (c *Client) sendToChat(ctx context.Context, m *tg.Message, text string) {
 	peer, err := c.inputPeer(chatIDFromPeer(m.PeerID))
 	if err != nil {
 		return
 	}
 	for _, chunk := range ai.SplitText(text, 4000) {
-		if _, err := message.NewSender(c.api).To(peer).Text(ctx, chunk); err != nil {
+		sender := message.NewSender(c.api).To(peer)
+		builder := &sender.Builder
+		if m.ID != 0 {
+			builder = builder.Reply(m.ID)
+		}
+		if _, err := builder.Text(ctx, chunk); err != nil {
 			return
 		}
 	}
@@ -677,7 +823,7 @@ func (c *Client) replySticker(ctx context.Context, m *tg.Message) {
 	if doc == nil {
 		return
 	}
-	if err := c.SendSticker(chatIDFromPeer(m.PeerID), doc); err != nil {
+	if err := c.sendSticker(chatIDFromPeer(m.PeerID), doc, m.ID); err != nil {
 		slog.Warn("sticker echo failed", "err", err.Error())
 	}
 }

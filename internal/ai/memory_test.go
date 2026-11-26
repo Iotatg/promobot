@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -120,6 +121,16 @@ func (f *fakeMem) SaveMemory(_ context.Context, key string, turns []Turn) error 
 func (f *fakeMem) ClearMemory(_ context.Context, key string) error {
 	delete(f.m, key)
 	return nil
+}
+func (f *fakeMem) ClearMemoryByPrefix(_ context.Context, prefix string) (int64, error) {
+	var n int64
+	for k := range f.m {
+		if strings.HasPrefix(k, prefix+"|") {
+			delete(f.m, k)
+			n++
+		}
+	}
+	return n, nil
 }
 
 func TestMemoryPersistenceAndIsolation(t *testing.T) {

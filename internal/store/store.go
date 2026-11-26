@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -102,6 +103,7 @@ type Store interface {
 	LoadMemory(ctx context.Context, key string, max int) ([]ai.Turn, error)
 	SaveMemory(ctx context.Context, key string, turns []ai.Turn) error
 	ClearMemory(ctx context.Context, key string) error
+	ClearMemoryByPrefix(ctx context.Context, prefix string) (int64, error)
 
 	// Assistant (userbot) accounts.
 	AddAccount(ctx context.Context, acc AssistantAccount) error
@@ -337,6 +339,20 @@ func (s *MongoStore) ClearMemory(ctx context.Context, key string) error {
 	}
 	_, err := s.memory.DeleteOne(ctx, bson.M{"_id": key})
 	return err
+}
+
+// ClearMemoryByPrefix deletes every memory document whose id begins with
+// prefix+"|", returning the number removed.
+func (s *MongoStore) ClearMemoryByPrefix(ctx context.Context, prefix string) (int64, error) {
+	if prefix == "" {
+		return 0, nil
+	}
+	filter := bson.M{"_id": bson.M{"$regex": "^" + regexp.QuoteMeta(prefix) + "\\|"}}
+	res, err := s.memory.DeleteMany(ctx, filter)
+	if err != nil {
+		return 0, err
+	}
+	return res.DeletedCount, nil
 }
 
 func (s *MongoStore) AddAccount(ctx context.Context, acc AssistantAccount) error {

@@ -25,6 +25,9 @@ type Assistant interface {
 	ResolveChat(target string) (int64, error)
 	// IsAdmin reports whether the assistant is an admin of the channel.
 	IsAdmin(chatID int64) (bool, error)
+	// CanPost reports whether the assistant can post in the chat: an admin, or
+	// for groups an unrestricted member.
+	CanPost(chatID int64) (bool, error)
 	// SendText sends a text message as the assistant.
 	SendText(chatID int64, text string) error
 	// SendMedia sends a media attachment as the assistant.
@@ -65,6 +68,12 @@ type SessionManager interface {
 	SetSystem(system string)
 	// SetPersonaName updates the group trigger/identity name on every account.
 	SetPersonaName(name string)
+	// SetReactMode updates the reaction decision mode on every account.
+	SetReactMode(mode string)
+	// ReactMode returns the current reaction decision mode.
+	ReactMode() string
+	// ClearAllMemory clears every user's stored conversation for all accounts.
+	ClearAllMemory(ctx context.Context) (int64, error)
 }
 
 // Bot is the owner-facing controller built on gotdbot.
@@ -125,6 +134,9 @@ func (b *Bot) Register() {
 	b.c.OnCommand("setstring", b.cmdSetString)
 	b.c.OnCommand("delstring", b.cmdDelString)
 	b.c.OnCommand("accounts", b.cmdAccounts)
+	b.c.OnCommand("reactmode", b.cmdReactMode)
+	b.c.OnCommand("clearmemory", b.cmdClearMemory)
+	b.c.OnCommand("clearmemorys", b.cmdClearMemory)
 	b.c.OnCallbackQuery(b.onCallback, nil)
 
 	if b.ai != nil {
@@ -152,7 +164,7 @@ func (b *Bot) resolveAndCheck(sender, target string) (int64, bool, error) {
 		if err != nil {
 			return 0, false, err
 		}
-		ok, err := b.assistant.IsAdmin(chatID)
+		ok, err := b.assistant.CanPost(chatID)
 		return chatID, ok, err
 	}
 	chatID, err := b.resolveChat(b.c, target)
@@ -165,8 +177,8 @@ func (b *Bot) resolveAndCheck(sender, target string) (int64, bool, error) {
 
 func (b *Bot) cmdStart(c *gotdbot.Client, msg *gotdbot.Message) error {
 	if !b.isOwner(msg) {
-		_, _ = msg.ReplyText(c, "This bot is private. You are not authorized.", nil)
-		return nil
+		_, err := msg.ReplyText(c, userHelpText, nil)
+		return err
 	}
 	go b.bootAnimation(msg.ChatId)
 	return nil
@@ -174,17 +186,19 @@ func (b *Bot) cmdStart(c *gotdbot.Client, msg *gotdbot.Message) error {
 
 func (b *Bot) cmdMenu(c *gotdbot.Client, msg *gotdbot.Message) error {
 	if !b.isOwner(msg) {
-		return nil
+		_, err := msg.ReplyText(c, userHelpText, nil)
+		return err
 	}
 	_, err := c.SendTextMessage(msg.ChatId, b.menuText(), &gotdbot.SendTextMessageOpts{ReplyMarkup: b.mainMenu()})
 	return err
 }
 
 func (b *Bot) cmdHelp(c *gotdbot.Client, msg *gotdbot.Message) error {
-	if !b.isOwner(msg) {
-		return nil
+	text := userHelpText
+	if b.isOwner(msg) {
+		text = helpText
 	}
-	_, err := msg.ReplyText(c, helpText, nil)
+	_, err := msg.ReplyText(c, text, nil)
 	return err
 }
 
@@ -216,7 +230,7 @@ func (b *Bot) cmdAddChannel(c *gotdbot.Client, msg *gotdbot.Message) error {
 		return rerr
 	}
 	if !ok {
-		_, rerr := msg.ReplyText(c, fmt.Sprintf("The %s account is not an admin of that chat.", sender), nil)
+		_, rerr := msg.ReplyText(c, fmt.Sprintf("The %s account cannot post in that chat (admin, or an unrestricted group member, is required).", sender), nil)
 		return rerr
 	}
 
@@ -568,7 +582,7 @@ func bootFrame(pct int, label string) string {
 
 const helpText = "Promobot - owner commands:\n\n" +
 	"/start - boot animation and main menu\n" +
-	"/addchannel <chat_id|@username> [bot|assistant] - register a chat you admin\n" +
+	"/addchannel <chat_id|@username> [bot|assistant] - register a chat you admin, or (assistant) a group you're a member of\n" +
 	"/delchannel <chat_id> - unregister a chat (stops posting there)\n" +
 	"/leave <chat_id> - make the assistant leave ONE registered chat\n" +
 	"/channels - list registered channels\n" +
@@ -586,6 +600,8 @@ const helpText = "Promobot - owner commands:\n\n" +
 	"/setstring <session> - connect an assistant account (max 5, message is deleted)\n" +
 	"/accounts - list connected assistant accounts\n" +
 	"/delstring [id] - disconnect one account, or all when no id is given\n" +
+	"/reactmode [offline|ai|both] - show or set how the assistant picks reactions (ai = assistant decides)\n" +
+	"/clearmemory - clear all users' assistant memory (alias: /clearmemorys)\n" +
 	"/ask <question> - ask the AI assistant (or reply to a message with /ask)\n" +
 	"/chat on|off - toggle mention-based auto replies in this chat\n" +
 	"/model [name] - show or change the active AI model\n" +
@@ -595,3 +611,12 @@ const helpText = "Promobot - owner commands:\n\n" +
 	"Broadcast targets your registered channels only. " +
 	"Joining/leaving is always explicit and one chat at a time (no bulk). " +
 	"Send /cancel during /newpost to abort."
+
+const userHelpText = "Promobot - user commands:\n\n" +
+	"/ask <question> - ask the AI assistant (or reply to a message with /ask)\n" +
+	"/sticker <mood> - send a random sticker from a mood pack\n" +
+	"/previewsticker <mood> - preview a sticker from a mood pack\n" +
+	"/stickerpacks - list available mood packs\n" +
+	"/id - show your user id and this chat id\n" +
+	"/help - this message\n\n" +
+	"In a chat where the chatbot is enabled, I reply when you @mention me or reply to my message."

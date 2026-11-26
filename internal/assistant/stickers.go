@@ -109,6 +109,12 @@ func (c *Client) SaveStickerDocument(ctx context.Context, doc *tg.Document, emoj
 
 // SendSticker sends an existing sticker document to a chat as the assistant.
 func (c *Client) SendSticker(chatID int64, doc *tg.Document) error {
+	return c.sendSticker(chatID, doc, 0)
+}
+
+// sendSticker sends an existing sticker document, optionally quoting the
+// message identified by replyTo (0 means no reply).
+func (c *Client) sendSticker(chatID int64, doc *tg.Document, replyTo int) error {
 	if doc == nil {
 		return fmt.Errorf("nil sticker document")
 	}
@@ -117,7 +123,12 @@ func (c *Client) SendSticker(chatID int64, doc *tg.Document) error {
 		return err
 	}
 	c.chooseSticker(context.Background(), peer)
-	_, err = message.NewSender(c.api).To(peer).Document(context.Background(), doc)
+	s := message.NewSender(c.api).To(peer)
+	b := &s.Builder
+	if replyTo > 0 {
+		b = b.Reply(replyTo)
+	}
+	_, err = b.Document(context.Background(), doc)
 	return err
 }
 
