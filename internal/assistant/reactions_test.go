@@ -1,6 +1,9 @@
 package assistant
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestChooseTextReaction(t *testing.T) {
 	cases := []struct {
@@ -64,6 +67,18 @@ func TestEmojiFromText(t *testing.T) {
 	}
 	if got := emojiFromText("no emoji here"); got != "" {
 		t.Errorf("emojiFromText = %q, want empty", got)
+	}
+}
+
+func TestReactCooldownFor(t *testing.T) {
+	if got := reactCooldownFor(ReactModeOffline); got != 10*time.Second {
+		t.Errorf("offline cooldown = %v, want 10s", got)
+	}
+	if got := reactCooldownFor(ReactModeAI); got != 30*time.Second {
+		t.Errorf("ai cooldown = %v, want 30s", got)
+	}
+	if got := reactCooldownFor(ReactModeBoth); got != 30*time.Second {
+		t.Errorf("both cooldown = %v, want 30s", got)
 	}
 }
 

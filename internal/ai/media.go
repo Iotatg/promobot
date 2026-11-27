@@ -207,8 +207,8 @@ func (c *Client) postMedia(ctx context.Context, model, text string, part map[str
 		return "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	if key := c.currentKey(); key != "" {
+		req.Header.Set("Authorization", "Bearer "+key)
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {

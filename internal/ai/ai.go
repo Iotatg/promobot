@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -123,11 +124,15 @@ func capEmoji(s, emoji string, n int) string {
 
 // Client is a minimal OpenAI-compatible chat completions client.
 type Client struct {
-	apiKey string
-	url    string
-	model  string
-	system string
-	http   *http.Client
+	// apiKeys is the ordered list of API keys: the primary first, then any
+	// fallbacks. On a 429 the client rotates to the next key.
+	apiKeys []string
+	keyMu   sync.Mutex
+	keyPos  int
+	url     string
+	model   string
+	system  string
+	http    *http.Client
 
 	mu       sync.Mutex
 	sessions map[string][]Turn
@@ -162,12 +167,23 @@ type Memory interface {
 
 // New creates an AI client. url is the full chat completions endpoint. system
 // is an optional system prompt prepended to every request (e.g. a persona).
-func New(apiKey, url, model, system string) *Client {
+// Optional fallbackKeys are tried in order when the primary key is rate-limited.
+func New(apiKey, url, model, system string, fallbackKeys ...string) *Client {
 	if strings.TrimSpace(model) == "" {
 		model = "free/gemini-4-hydrogen"
 	}
+	keys := make([]string, 0, 1+len(fallbackKeys))
+	seen := make(map[string]bool)
+	for _, k := range append([]string{apiKey}, fallbackKeys...) {
+		k = strings.TrimSpace(k)
+		if k == "" || seen[k] {
+			continue
+		}
+		seen[k] = true
+		keys = append(keys, k)
+	}
 	return &Client{
-		apiKey:   strings.TrimSpace(apiKey),
+		apiKeys:  keys,
 		url:      strings.TrimSpace(url),
 		model:    model,
 		system:   system,
@@ -176,6 +192,25 @@ func New(apiKey, url, model, system string) *Client {
 		loaded:   make(map[string]bool),
 		maxTurns: defaultMaxTurns,
 	}
+}
+
+// currentKey returns the key to use for the next request.
+func (c *Client) currentKey() string {
+	c.keyMu.Lock()
+	defer c.keyMu.Unlock()
+	if len(c.apiKeys) == 0 {
+		return ""
+	}
+	return c.apiKeys[c.keyPos%len(c.apiKeys)]
+}
+
+// rotateKey advances to the next key (used after a 429 rate limit).
+func (c *Client) rotateKey() {
+	c.keyMu.Lock()
+	if len(c.apiKeys) > 1 {
+		c.keyPos = (c.keyPos + 1) % len(c.apiKeys)
+	}
+	c.keyMu.Unlock()
 }
 
 // SetMemory installs a persistence backend and a namespace prefix used to key
@@ -195,7 +230,7 @@ func (c *Client) Clone() *Client {
 		return nil
 	}
 	return &Client{
-		apiKey:      c.apiKey,
+		apiKeys:     append([]string(nil), c.apiKeys...),
 		url:         c.url,
 		model:       c.model,
 		system:      c.system,
@@ -368,40 +403,68 @@ func (c *Client) ask(ctx context.Context, model, key, prompt string) (string, er
 }
 
 // rawChat marshals and sends a chat request, returning the first choice content.
+// A 429 (rate limit) is retried a few times with backoff, honoring Retry-After.
 func (c *Client) rawChat(ctx context.Context, reqBody chatRequest) (string, error) {
 	payload, err := json.Marshal(reqBody)
 	if err != nil {
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(payload))
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(payload))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if key := c.currentKey(); key != "" {
+			req.Header.Set("Authorization", "Bearer "+key)
+		}
 
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return "", err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("llm status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			var parsed chatResponse
+			if err := json.Unmarshal(body, &parsed); err != nil {
+				return "", fmt.Errorf("decode llm response: %w", err)
+			}
+			if len(parsed.Choices) == 0 {
+				return "", fmt.Errorf("llm returned no choices")
+			}
+			return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+		}
 
-	var parsed chatResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("decode llm response: %w", err)
+		lastErr = fmt.Errorf("llm status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		if resp.StatusCode != http.StatusTooManyRequests || attempt == maxAttempts-1 {
+			return "", lastErr
+		}
+		// Rotate to the next key (if any) before backing off, so a second key
+		// can take over when the primary is rate-limited.
+		c.rotateKey()
+		wait := retryAfterDelay(resp.Header.Get("Retry-After"), attempt)
+		slog.Warn("llm rate limited, retrying", "attempt", attempt+1, "wait", wait)
+		select {
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-time.After(wait):
+		}
 	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("llm returned no choices")
+	return "", lastErr
+}
+
+// retryAfterDelay returns how long to wait before retrying a 429. It honors a
+// Retry-After header (integer seconds) and otherwise backs off exponentially.
+func retryAfterDelay(header string, attempt int) time.Duration {
+	if secs, err := strconv.Atoi(strings.TrimSpace(header)); err == nil && secs > 0 {
+		return time.Duration(secs) * time.Second
 	}
-	return strings.TrimSpace(parsed.Choices[0].Message.Content), nil
+	return time.Duration(1<<uint(attempt)) * time.Second
 }
 
 // DecideMood asks the model to classify the mood of a chat message into a single

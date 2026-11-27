@@ -71,7 +71,7 @@ func run(logger *slog.Logger) error {
 				DOB:   cfg.PersonaDOB,
 				From:  cfg.PersonaFrom,
 				Owner: "meri creator",
-			}.System())
+			}.System(), cfg.UserLLMFallbackAPIKey)
 			aiClient.SetMemory(st, "bot")
 			logger.Info("chatbot enabled", "model", aiClient.Model())
 		}

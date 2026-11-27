@@ -57,6 +57,13 @@ type Client struct {
 	reactMu   sync.Mutex
 	lastReact map[int64]time.Time
 	reactMode string
+	// globalReactTimes holds the timestamps of recent reactions across all
+	// chats (sliding window) so the account never trips Telegram's global
+	// FLOOD_WAIT; lastGlobalReact is the last such timestamp.
+	globalReactTimes []time.Time
+	lastGlobalReact  time.Time
+	// globalBlockUntil pauses all reactions until this time after a FLOOD_WAIT.
+	globalBlockUntil time.Time
 
 	packsMu   sync.Mutex
 	autoPacks map[string]*PackInfo

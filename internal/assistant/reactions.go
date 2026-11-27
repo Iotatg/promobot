@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -160,8 +161,84 @@ var reactNeutral = map[string]bool{
 const (
 	reactProbability = 0.30
 	reactCooldown    = 10 * time.Second
+	reactAICooldown  = 30 * time.Second
 	reactBiasChance  = 0.35
+
+	// Global (process-wide) reaction rate limit. Per-chat cooldowns alone are
+	// not enough: with many groups the assistant can fire reactions fast enough
+	// to hit Telegram's global flood limit (FLOOD_WAIT). These bound the total
+	// rate across every chat.
+	reactGlobalGap          = 5 * time.Second
+	reactGlobalWindow       = time.Minute
+	reactGlobalMaxPerWindow = 10
 )
+
+// allowGlobalReact enforces the process-wide reaction rate limit. It returns
+// true (and records the attempt) when a reaction may proceed, false when the
+// global gap or per-window cap would be exceeded.
+func (c *Client) allowGlobalReact(now time.Time) bool {
+	c.reactMu.Lock()
+	defer c.reactMu.Unlock()
+
+	cutoff := now.Add(-reactGlobalWindow)
+	kept := c.globalReactTimes[:0]
+	for _, t := range c.globalReactTimes {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	c.globalReactTimes = kept
+
+	if now.Before(c.globalBlockUntil) {
+		return false
+	}
+	if !c.lastGlobalReact.IsZero() && now.Sub(c.lastGlobalReact) < reactGlobalGap {
+		return false
+	}
+	if len(c.globalReactTimes) >= reactGlobalMaxPerWindow {
+		return false
+	}
+	c.globalReactTimes = append(c.globalReactTimes, now)
+	c.lastGlobalReact = now
+	return true
+}
+
+// floodWaitRe extracts the retry-after seconds from a Telegram FLOOD_WAIT error.
+var floodWaitRe = regexp.MustCompile(`FLOOD_WAIT \((\d+)\)`)
+
+// noteFloodWait pauses all reactions for the server-requested duration (plus a
+// small buffer) so the flood penalty can decay instead of being refreshed by
+// repeated attempts.
+func (c *Client) noteFloodWait(err error) {
+	if err == nil {
+		return
+	}
+	m := floodWaitRe.FindStringSubmatch(err.Error())
+	if len(m) != 2 {
+		return
+	}
+	secs, convErr := strconv.Atoi(m[1])
+	if convErr != nil || secs <= 0 {
+		return
+	}
+	until := time.Now().Add(time.Duration(secs)*time.Second + 2*time.Second)
+	c.reactMu.Lock()
+	if until.After(c.globalBlockUntil) {
+		c.globalBlockUntil = until
+	}
+	c.reactMu.Unlock()
+	slog.Warn("assistant reactions paused after FLOOD_WAIT", "seconds", secs)
+}
+
+// reactCooldownFor returns the per-chat cooldown for the given mode: offline
+// stays snappy, while AI/both modes use a longer window so the model never
+// spams reactions.
+func reactCooldownFor(mode string) time.Duration {
+	if mode == ReactModeOffline {
+		return reactCooldown
+	}
+	return reactAICooldown
+}
 
 // reactRequestRe matches an explicit ask to react ("react to this", "reaction
 // do", "ek reaction de", "react with 🔥").
@@ -170,6 +247,36 @@ var reactRequestRe = regexp.MustCompile(`(?i)\b(react|reaction|react karo|react 
 // wantsReact reports whether the message explicitly asks the assistant to react.
 func wantsReact(text string) bool {
 	return reactRequestRe.MatchString(text)
+}
+
+// directedAtSelf reports whether m is addressed to the assistant: a DM, an
+// @username or persona-name mention, a mention-name entity, or a reply to one
+// of the assistant's own messages (via the reply header, without a network
+// fetch). AI reactions are gated on this so the model only reacts when a user
+// actually tags or messages the assistant, never on every message or emoji.
+func (c *Client) directedAtSelf(m *tg.Message, text string) bool {
+	if _, ok := m.PeerID.(*tg.PeerUser); ok {
+		return true
+	}
+	if c.selfUsername != "" && strings.Contains(strings.ToLower(text), "@"+c.selfUsername) {
+		return true
+	}
+	for _, ent := range m.Entities {
+		if mn, ok := ent.(*tg.MessageEntityMentionName); ok && c.selfID != 0 && mn.UserID == c.selfID {
+			return true
+		}
+	}
+	if c.personaRe != nil && c.personaRe.MatchString(text) {
+		return true
+	}
+	if rh, ok := m.ReplyTo.(*tg.MessageReplyHeader); ok {
+		if fwd, ok := rh.GetReplyFrom(); ok {
+			if u, ok := fwd.FromID.(*tg.PeerUser); ok && c.selfID != 0 && u.UserID == c.selfID {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // maybeReact fires a single emoji reaction on m, best-effort and never fatal.
@@ -195,9 +302,11 @@ func (c *Client) maybeReact(ctx context.Context, m *tg.Message) {
 	chatID := chatIDFromPeer(m.PeerID)
 	now := time.Now()
 	mode := c.reactModeValue()
+	directed := c.directedAtSelf(m, text)
 	if !forced {
+		cooldown := reactCooldownFor(mode)
 		c.reactMu.Lock()
-		if last, ok := c.lastReact[chatID]; ok && now.Sub(last) < reactCooldown {
+		if last, ok := c.lastReact[chatID]; ok && now.Sub(last) < cooldown {
 			c.reactMu.Unlock()
 			return
 		}
@@ -230,8 +339,11 @@ func (c *Client) maybeReact(ctx context.Context, m *tg.Message) {
 		}
 	}
 	// Model decision (ai or both modes): the assistant classifies the mood and
-	// reacts with that type of emoji (a small set), or nothing for "none".
-	if len(chosen) == 0 && (mode == ReactModeAI || mode == ReactModeBoth) && c.ai != nil {
+	// reacts with that type of emoji (a small set), or nothing for "none". It
+	// only runs when the message actually addresses the assistant (tag, reply
+	// or DM) or is an explicit react request, so the AI never spams a reaction
+	// on every message or emoji.
+	if len(chosen) == 0 && (mode == ReactModeAI || mode == ReactModeBoth) && c.ai != nil && (directed || forced) {
 		if mood, err := c.ai.DecideMood(ctx, reactionPromptText(m, text)); err == nil {
 			chosen = pickMoodReactions(mood)
 			slog.Debug("ai reaction mood", "mood", mood, "emojis", chosen)
@@ -256,6 +368,13 @@ func (c *Client) maybeReact(ctx context.Context, m *tg.Message) {
 	}
 	chosen = cleaned
 
+	// Enforce the global rate limit last, so a blocked reaction never updates
+	// the per-chat cooldown and can be retried on the next message.
+	if !c.allowGlobalReact(time.Now()) {
+		slog.Debug("assistant reaction skipped: global rate limit", "chat", chatID)
+		return
+	}
+
 	peer, err := c.inputPeer(chatID)
 	if err != nil {
 		slog.Warn("assistant reaction: resolve peer failed", "chat", chatID, "err", err)
@@ -270,12 +389,14 @@ func (c *Client) maybeReact(ctx context.Context, m *tg.Message) {
 		// with just the first emoji before giving up.
 		if len(chosen) > 1 {
 			if _, err2 := c.sendReaction(ctx, peer, m.ID, chosen[:1]); err2 != nil {
+				c.noteFloodWait(err2)
 				slog.Warn("assistant reaction failed", "chat", chatID, "msg", m.ID, "emoji", chosen, "err", err2)
 				return
 			}
 			slog.Info("assistant reacted", "chat", chatID, "msg", m.ID, "emoji", chosen[:1], "forced", forced)
 			return
 		}
+		c.noteFloodWait(err)
 		slog.Warn("assistant reaction failed", "chat", chatID, "msg", m.ID, "emoji", chosen, "err", err)
 		return
 	}

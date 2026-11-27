@@ -59,10 +59,11 @@ type Config struct {
 	AssistantSession string
 
 	// Chatbot (OpenAI-compatible LLM).
-	UserLLMAPIKey  string
-	UserLLMBase    string
-	UserLLMChatURL string
-	UserLLMModel   string
+	UserLLMAPIKey         string
+	UserLLMFallbackAPIKey string
+	UserLLMBase           string
+	UserLLMChatURL        string
+	UserLLMModel          string
 
 	// Persona (Radhika) identity.
 	PersonaName string
@@ -122,10 +123,11 @@ func Load() (*Config, error) {
 		AssistantFilesDir:    getString("ASSISTANT_FILES_DIR", "./.tdlib/assistant_files"),
 		AssistantSession:     getString("ASSISTANT_SESSION", ""),
 
-		UserLLMAPIKey:  getString("USER_LLM_API_KEY", ""),
-		UserLLMBase:    getString("USER_LLM_BASE_URL", ""),
-		UserLLMChatURL: getString("USER_LLM_CHAT_URL", ""),
-		UserLLMModel:   getString("USER_LLM_MODEL", "free/gemini-4-hydrogen"),
+		UserLLMAPIKey:         getString("USER_LLM_API_KEY", ""),
+		UserLLMFallbackAPIKey: getString("USER_LLM_FALLBACK_API_KEY", ""),
+		UserLLMBase:           getString("USER_LLM_BASE_URL", ""),
+		UserLLMChatURL:        getString("USER_LLM_CHAT_URL", ""),
+		UserLLMModel:          getString("USER_LLM_MODEL", "free/gemini-4-hydrogen"),
 
 		PersonaName: getString("PERSONA_NAME", "Radhika"),
 		PersonaAge:  getString("PERSONA_AGE", "20"),
